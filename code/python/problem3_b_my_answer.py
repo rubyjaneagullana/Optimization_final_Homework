@@ -7,7 +7,7 @@ import cvxpy as cp
 import matplotlib.pyplot as plt
 
 
-NUM_ANA = 40
+NUM_ANA =32
 CARR_FREQ = 2.4e9
 LIGHT_SPEED = 299_792_458.0
 WAVE_LEN = LIGHT_SPEED / CARR_FREQ
@@ -69,8 +69,8 @@ ax.set_ylabel("Angle Response (dB)")
 ax.text(-80, -10, fmt)
 ax.set_xlim([-90, 90])
 ax.set_ylim([-120, 0])
-fig.savefig("problem3a.png", dpi=300, bbox_inches="tight")
-with open("problem3a.fig.pickle", "wb") as fig_file:
+fig.savefig("problem3_b_my_answer.png", dpi=300, bbox_inches="tight")
+with open("problem3_b_my_answer.fig.pickle", "wb") as fig_file:
     pickle.dump(fig, fig_file)
 plt.show()
 plt.close(fig)

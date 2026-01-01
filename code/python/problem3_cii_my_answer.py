@@ -1,12 +1,13 @@
 """Worst-case sidelobe minimization with a narrow 15°–25° mainlobe."""
 
+import pickle
 import numpy as np
 import cvxpy as cp
 import matplotlib.pyplot as plt
 
 
-theta_l = 15
-theta_u = 25
+theta_l = 45
+theta_u = 55
 NUM_ANA = 40
 FREQ = 2.4e9
 WAVE_LEN = 3e8 / FREQ
@@ -43,22 +44,32 @@ for angle in range(theta_u, 91):
 
 problem = cp.Problem(cp.Minimize(t), constraints)
 try:
-    problem.solve(solver=cp.CLARABEL)
+    problem.solve(solver=cp.MOSEK)
 except cp.SolverError:
     problem.solve()
 
-angles = np.arange(-90, 91)
+angles = np.arange(-90, 91,0.1)
 steering_vec_plot = np.exp(
     -1j * np.outer(np.sin(np.deg2rad(angles)), indices) * 2 * np.pi * ANTENNA_DIS / WAVE_LEN
 )
 # Inspect the final beampattern to confirm the worst-case bound.
 pattern_db = 10 * np.log10(np.abs(np.conj(w.value) @ steering_vec_plot.T) ** 2 + 1e-12)
 
-plt.figure()
-plt.plot(angles, pattern_db)
-plt.title("Minimizing the Worst-case Sidelobe")
-plt.grid(True)
-plt.xlabel("Angle (degree)")
-plt.ylabel("Angle Response (dB)")
-plt.xlim([-90, 90])
+fig, ax = plt.subplots()
+ax.plot(angles, pattern_db)
+ax.set_title("Problem3c(ii) Minimizing the Worst-case Sidelobe ")
+fmt = (
+    rf"$M={NUM_ANA},\ \theta_d={ANGLE_DES},\ "
+    rf"\theta_\ell={theta_l},\ \theta_u={theta_u}$"
+    )
+ax.grid(True)
+ax.set_xlabel("Angle (degree)")
+ax.set_ylabel("Angle Response (dB)")
+ax.text(-80, -10, fmt)
+ax.set_xlim([-90, 90])
+ax.set_ylim([-120, 0])
+fig.savefig("problem3_cii_my_answer.png", dpi=300, bbox_inches="tight")
+with open("problem3_cii_my_answer.fig.pickle", "wb") as fig_file:
+    pickle.dump(fig, fig_file)
 plt.show()
+plt.close(fig)
