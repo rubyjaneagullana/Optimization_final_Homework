@@ -1,0 +1,349 @@
+
+import numpy as np
+import cvxpy as cp
+import matplotlib.pyplot as plt
+
+# =========================
+# Parameters 
+# =========================
+c0 = 3e8
+fc = 28e9                      # carrier frequency (Hz)
+lam = c0 / fc
+neff = 1.4                     # effective refractive index
+lam_g = lam / neff
+N_t = 20                       # number of PAs along waveguide
+h_bs = 3.0                     # BS / waveguide height (m)
+D1, D2 = 6.0, 10.0             # user region: 6 x 10 m^2
+K = 3                          #number of users
+Rmin = 0.5                     # bit/s/Hz
+sigma2_dBm = -90.0
+sigma2 = 10 ** ((sigma2_dBm - 30.0) / 10.0)  # W
+
+
+
+
+# Monte-Carlo averaging 
+NUM_REAL = 100
+
+
+Nt_list = [10, 15, 20]
+
+# =========================
+# Solver / iteration knobs (algorithmic settings; not system parameters)
+# =========================
+AO_MAX = 3        # alternating optimization outer iterations
+SCA_MAX = 2       # SCA inner iterations
+SCS_MAX_ITERS = 3000
+SCS_EPS = 1e-4
+
+rng = np.random.default_rng(7)  # reproducibility
+
+LN2 = np.log(2.0)
+
+# =========================
+# Helpers: geometry + channels
+# =========================
+def waveguide_transfer(dist_bs_to_pa):
+    """
+    Paper Eq. (1)-style: h_Pn = 10^{-kappa*dist/10} * exp(-j*2*pi*dist/lambda_g)
+    """
+    amp = 10 ** (-(kappa_db_per_m * dist_bs_to_pa) / 10.0)
+    ph = np.exp(-1j * 2.0 * np.pi * dist_bs_to_pa / lam_g)
+    return amp * ph
+
+def build_channels(Nt, user_xy):
+    """
+    Paper Eq. (2)-style: h_{k,n} = h_Pn * (lambda / (4*pi*|psiU-psiPA|))
+    Coordinate model (from paper figure/description):
+      - Region: x in [0,D1], y in [0,D2], users at z=0
+      - Waveguide at y=0, z=h_bs with Nt equally spaced PAs along x
+      - BS at (D1/2, 0, h_bs)
+    """
+    # PA x-positions: equally spaced along [0, D1]
+    x_pa = np.linspace(0.0, D1, Nt)
+    y_pa = np.zeros_like(x_pa)
+    z_pa = np.full_like(x_pa, h_bs)
+
+    # BS for waveguide path distance (used in h_Pn)
+    x_bs = D1 / 2.0
+
+    # waveguide transfer per PA
+    dist_bs_to_pa = np.abs(x_bs - x_pa)  # along waveguide (same y,z)
+    hP = waveguide_transfer(dist_bs_to_pa)  # (Nt,)
+
+    # build K user channel vectors (Nt x 1 each)
+    H = []
+    for (xu, yu) in user_xy:
+        du_pa = np.sqrt((xu - x_pa) ** 2 + (yu - y_pa) ** 2 + (0.0 - z_pa) ** 2)
+        hk = hP * (lam / (4.0 * np.pi * du_pa))
+        H.append(hk.reshape(-1, 1))  # (Nt,1)
+    return H  # list of K vectors
+
+def effective_gain(hk, p):
+    """
+    |h_k^H p|^2 with hk complex (Nt,1), p real (Nt,1)
+    """
+    return float(np.abs((hk.conj().T @ p)[0, 0]) ** 2)
+
+# =========================
+# Closed-form NOMA alpha* (paper Sec IV-A, eqs similar to (15)-(16))
+# =========================
+def alpha_closed_form(hbar, Rmin):
+    """
+    hbar: array length K, hbar_k = |h_k^H p|^2 / sigma2, sorted in SIC order (weak->strong)
+    """
+    K = len(hbar)
+    a = 2.0 ** Rmin
+    beta = (a - 1.0) / a  # = 1 - 2^{-Rmin}
+    betas = np.full(K - 1, beta, dtype=float)
+
+    alpha = np.zeros(K, dtype=float)
+    for i in range(1, K):  # i = 1..K-1 (1-based)
+        # products/sums from the paper expression
+        prod1 = 1.0
+        for j in range(1, i):  # j=1..i-1
+            prod1 *= (1.0 - betas[j - 1])
+
+        term2 = 1.0 / max(hbar[i - 1], 1e-30)
+
+        term3 = 0.0
+        for j in range(1, i):  # j=1..i-1
+            prod2 = 1.0
+            for kk in range(j + 1, i):  # k=j+1..i-1
+                prod2 *= (1.0 - betas[kk - 1])
+            term3 += prod2 * betas[j - 1] / max(hbar[j - 1], 1e-30)
+
+        alpha_i = betas[i - 1] * (prod1 + term2 - term3)
+        alpha[i - 1] = max(alpha_i, 0.0)
+
+    alpha[-1] = max(1.0 - np.sum(alpha[:-1]), 0.0)
+
+    # guard: keep sum <= 1
+    s = np.sum(alpha)
+    if s > 1.0 + 1e-9:
+        alpha = alpha / s
+
+    return alpha
+
+def sum_rate_noma(H_ordered, p, alpha):
+    """
+    Paper Eq.(9)-type NOMA rate with SIC order = list order (weak->strong)
+    """
+    K = len(H_ordered)
+    rates = np.zeros(K, dtype=float)
+    for k in range(K):
+        gk = effective_gain(H_ordered[k], p)
+        interf = np.sum(alpha[k + 1:]) if (k < K - 1) else 0.0
+        sinr = (gk * alpha[k]) / (gk * interf + sigma2)
+        rates[k] = np.log2(1.0 + sinr)
+    return float(np.sum(rates))
+
+# =========================
+# SCA step (paper Sec IV-B) solved by CVXPY
+# We eliminate Q_k as a variable: Q_k is an affine expression in p (via the Taylor form),
+# so all h^H Q h and Tr(AQ) stay affine in p => CVXPY is fast.
+# =========================
+def sca_optimize_p(H_ordered, alpha, p_init, Ptot):
+    Nt = p_init.shape[0]
+    p_prev = p_init.copy()  # (Nt,1)
+    hhH = [H_ordered[k] @ H_ordered[k].conj().T for k in range(K)]  # constants
+
+    # cumulative alpha sums: s_k = sum_{j=k..K} alpha_j  (1-based)
+    s = np.array([np.sum(alpha[k:]) for k in range(K)], dtype=float)
+
+    a = 2.0 ** Rmin
+
+    for _ in range(SCA_MAX):
+        # CVXPY variable
+        p = cp.Variable((Nt, 1), nonneg=True)
+
+        # Taylor approx of pp^T around p_prev: p_prev p^T + p p_prev^T - p_prev p_prev^T
+        ppT_approx = (p_prev @ p.T) + (p @ p_prev.T) - (p_prev @ p_prev.T)  # (Nt,Nt), affine in p
+
+        # Build Qk expressions (affine in p)
+        Q = []
+        for k in range(K):
+            Qk = (s[k] / sigma2) * ppT_approx
+            Q.append(Qk)
+
+        # --- objective: sum_k F'_k (paper eqs ~ (19)-(22))
+        obj_terms = []
+
+        # k=1 term: log2(1 + h1^H Q1 h1)
+        x11 = cp.real(cp.trace(Q[0] @ hhH[0]))
+        obj_terms.append(cp.log1p(x11) / LN2)
+
+        # k=2..K: log2(1 + hk^H Qk hk) - linearized log2(1 + h_{k-1}^H Qk h_{k-1})
+        for k in range(1, K):
+            xkk = cp.real(cp.trace(Q[k] @ hhH[k]))  # affine
+            # linearization point x0 = h_{k-1}^H Qk0 h_{k-1}
+            Qk0 = (s[k] / sigma2) * (p_prev @ p_prev.T)
+            x0 = float(np.real(np.trace(Qk0 @ hhH[k - 1])))
+            grad = 1.0 / (LN2 * (1.0 + x0))
+            A = grad * hhH[k - 1]  # constant matrix
+            B = np.log2(1.0 + x0) - float(np.real(np.trace(A @ Qk0)))
+            obj_terms.append((cp.log1p(xkk) / LN2) - cp.real(cp.trace(A @ Q[k])) - B)
+
+        objective = cp.Maximize(cp.sum(obj_terms))
+
+        # --- constraints
+        cons = []
+        cons.append(cp.sum(p) == Ptot)
+
+        # domain/positivity for log arguments
+        for k in range(K):
+            cons.append(cp.real(cp.trace(Q[k] @ hhH[k])) >= 0.0)
+
+        # QoS constraints (paper C2, C3 derived from (21)-(22)-type)
+        for k in range(K - 1):
+            expr = cp.real(cp.trace((Q[k] - a * Q[k + 1]) @ hhH[k])) + (1.0 - a)
+            cons.append(expr >= 0.0)
+        cons.append(cp.real(cp.trace(Q[K - 1] @ hhH[K - 1])) >= (a - 1.0))
+
+        # SIC constraints (paper C1 with SCA lower bound G')
+        # ordered users => need pairs (k,j) with j>k
+        for k in range(K - 1):
+            for j in range(k + 1, K):
+                # constants at expansion point (p_prev)
+                Qk0 = (s[k] / sigma2) * (p_prev @ p_prev.T)
+                Qkp10 = (s[k + 1] / sigma2) * (p_prev @ p_prev.T)
+
+                c0 = float(np.real(np.trace(Qkp10 @ (H_ordered[j] @ H_ordered[j].conj().T))))
+                d0 = float(np.real(np.trace(Qk0 @ (H_ordered[k] @ H_ordered[k].conj().T))))
+                grad_c = 1.0 / (LN2 * (1.0 + c0))
+                grad_d = 1.0 / (LN2 * (1.0 + d0))
+
+                E = grad_c * (H_ordered[j] @ H_ordered[j].conj().T)
+                F = grad_d * (H_ordered[k] @ H_ordered[k].conj().T)
+
+                Dconst = (np.log2(1.0 + float(np.real(np.trace(Qk0 @ (H_ordered[j] @ H_ordered[j].conj().T))))) +
+                          np.log2(1.0 + float(np.real(np.trace(Qkp10 @ (H_ordered[k] @ H_ordered[k].conj().T))))) -
+                          float(np.real(np.trace(E @ Qkp10))) - float(np.real(np.trace(F @ Qk0))))
+
+                term_pos = (cp.log1p(cp.real(cp.trace(Q[k] @ (H_ordered[j] @ H_ordered[j].conj().T)))) / LN2 +
+                            cp.log1p(cp.real(cp.trace(Q[k + 1] @ (H_ordered[k] @ H_ordered[k].conj().T)))) / LN2)
+
+                term_lin = cp.real(cp.trace(E @ Q[k + 1])) + cp.real(cp.trace(F @ Q[k]))
+
+                cons.append(term_pos - term_lin - Dconst >= 0.0)
+
+        prob = cp.Problem(objective, cons)
+        prob.solve(solver=cp.SCS, verbose=False, max_iters=SCS_MAX_ITERS, eps=SCS_EPS)
+
+        if p.value is None:
+            # if infeasible/failed, keep previous
+            break
+
+        p_new = np.maximum(p.value, 0.0)
+        # simple convergence check
+        if np.linalg.norm(p_new - p_prev) / (np.linalg.norm(p_prev) + 1e-12) < 1e-3:
+            p_prev = p_new
+            break
+        p_prev = p_new
+
+    return p_prev
+
+# =========================
+# AO: alpha* (closed-form) <-> p (SCA via CVXPY)
+# =========================
+def optimize_gpr(H, Ptot):
+    """
+    H: list of K channels (Nt,1)
+    returns: achieved sum-rate for GPR for this realization at power Ptot
+    """
+    Nt = H[0].shape[0]
+    p = (Ptot / Nt) * np.ones((Nt, 1), dtype=float)
+
+    prev_R = -1e9
+    for _ in range(AO_MAX):
+        # determine SIC order from current effective gains
+        gains = np.array([effective_gain(H[k], p) for k in range(K)], dtype=float)
+        order = np.argsort(gains)  # weak -> strong
+        H_ord = [H[i] for i in order]
+
+        # closed-form alpha* using hbar = gain/sigma2
+        gains_ord = np.array([effective_gain(H_ord[k], p) for k in range(K)], dtype=float)
+        hbar = gains_ord / sigma2
+        alpha = alpha_closed_form(hbar, Rmin)
+
+        # optimize p via SCA
+        p = sca_optimize_p(H_ord, alpha, p, Ptot)
+
+        # compute sum-rate
+        R = sum_rate_noma(H_ord, p, alpha)
+        if abs(R - prev_R) < 1e-3:
+            break
+        prev_R = R
+
+    return prev_R
+
+def evaluate_epr(H, Ptot):
+    """
+    EPR baseline: equal radiation p, but still uses the paper's closed-form alpha*.
+    """
+    Nt = H[0].shape[0]
+    p = (Ptot / Nt) * np.ones((Nt, 1), dtype=float)
+
+    gains = np.array([effective_gain(H[k], p) for k in range(K)], dtype=float)
+    order = np.argsort(gains)
+    H_ord = [H[i] for i in order]
+
+    gains_ord = np.array([effective_gain(H_ord[k], p) for k in range(K)], dtype=float)
+    hbar = gains_ord / sigma2
+    alpha = alpha_closed_form(hbar, Rmin)
+
+    return sum_rate_noma(H_ord, p, alpha)
+
+# =========================
+# Main simulation: ONLY Fig.2(a)
+# =========================
+def run_fig2a():
+    results = {}  # (Nt, "GPR"/"EPR") -> y array
+
+    # Pre-generate user deployments (paper averages over realizations)
+    user_xy_all = []
+    for _ in range(NUM_REAL):
+        xs = rng.uniform(0.0, D1, size=K)
+        ys = rng.uniform(0.0, D2, size=K)
+        user_xy_all.append(list(zip(xs, ys)))
+
+    for Nt in Nt_list:
+        yg = np.zeros_like(P_W_list, dtype=float)
+        ye = np.zeros_like(P_W_list, dtype=float)
+
+        # build channels per realization for this Nt once (channels do not depend on Ptot)
+        H_all = []
+        for r in range(NUM_REAL):
+            H_all.append(build_channels(Nt, user_xy_all[r]))
+
+        for ip, Ptot in enumerate(P_W_list):
+            # average over realizations
+            g_acc = 0.0
+            e_acc = 0.0
+            for r in range(NUM_REAL):
+                H = H_all[r]
+                g_acc += optimize_gpr(H, Ptot)
+                e_acc += evaluate_epr(H, Ptot)
+            yg[ip] = g_acc / NUM_REAL
+            ye[ip] = e_acc / NUM_REAL
+
+        results[(Nt, "GPR")] = yg
+        results[(Nt, "EPR")] = ye
+
+    # Plot: ONLY Fig 2(a)
+    plt.figure()
+    for Nt in Nt_list:
+        plt.plot(P_dBm_list, results[(Nt, "GPR")], marker="o", label=f"$N_t={Nt}$ GPR model")
+        plt.plot(P_dBm_list, results[(Nt, "EPR")], marker="s", label=f"$N_t={Nt}$ EPR model")
+
+    plt.xlabel("Transmit Power (dBm)")
+    plt.ylabel("Average Sum Rate (bits/s/Hz)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("fig2a.png", dpi=300)
+    plt.close()
+
+if __name__ == "__main__":
+    run_fig2a()
+    print("Saved: fig2a.png")
